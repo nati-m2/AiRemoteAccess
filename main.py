@@ -75,8 +75,8 @@ def _cf_download_url():
 TEMP_DIR = _temp_dir()
 CF_DOWNLOAD_URL = _cf_download_url()
 CF_EXE = os.path.join(TEMP_DIR, 'cloudflared.exe' if os.name == 'nt' else 'cloudflared')
-TUNNEL_LOG_FILE = os.path.join(TEMP_DIR, 'hermes_tunnel.log')
-AUDIT_LOG_FILE = os.path.join(os.getcwd(), 'hermes_audit.log')
+TUNNEL_LOG_FILE = os.path.join(TEMP_DIR, 'warp_tunnel.log')
+AUDIT_LOG_FILE = os.path.join(os.getcwd(), 'warp_audit.log')
 
 
 class ConnectionMode(Enum):
@@ -442,8 +442,8 @@ def stop_connection(state):
     state.status_queue.put({'type': 'stopped'})
 
 
-class HermesUI:
-    '''Modern Tkinter control panel for Hermes Remote Access.'''
+class WarpUI:
+    '''Modern Tkinter control panel for Warp.'''
 
     # Color palette for the dark, modern theme
     BG = '#161a23'
@@ -461,10 +461,11 @@ class HermesUI:
     def __init__(self, root, state):
         self.root = root
         self.state = state
-        self.root.title('Ai Remote Access')
+        self.root.title('Warp')
         self.root.geometry('800x740')
         self.root.minsize(560, 560)
         self.root.configure(bg=self.BG)
+        self._set_icon()
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self.mode_var = tk.StringVar(value=MODE_LABELS[ConnectionMode.LOCAL])
@@ -533,7 +534,7 @@ class HermesUI:
         # Header
         header = ttk.Frame(outer, style='TFrame')
         header.grid(row=0, column=0, sticky='ew', pady=(0, 16))
-        ttk.Label(header, text='🛰  Ai Remote Access', style='Title.TLabel').pack(side=tk.LEFT)
+        ttk.Label(header, text='🌀  Warp', style='Title.TLabel').pack(side=tk.LEFT)
 
         # Settings card
         settings = ttk.Frame(outer, style='Card.TFrame', padding=16)
@@ -675,6 +676,19 @@ class HermesUI:
             self.start_btn.config(state='normal')
             self.stop_btn.config(state='disabled')
 
+    def _set_icon(self):
+        icon_name = 'app_icon.ico'
+        if getattr(sys, 'frozen', False):
+            base = sys._MEIPASS
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(base, icon_name)
+        if os.path.isfile(icon_path):
+            try:
+                self.root.iconbitmap(icon_path)
+            except Exception:
+                pass
+
     def _on_close(self):
         if self.state.running:
             self._on_stop()
@@ -692,7 +706,7 @@ def _is_console_build():
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description='Hermes Remote Access')
+    parser = argparse.ArgumentParser(description='Warp Remote Access')
     parser.add_argument('--mode', choices=[ConnectionMode.LOCAL.value, ConnectionMode.CLOUDFLARE.value],
                         default=ConnectionMode.LOCAL.value, help='Connection mode')
     parser.add_argument('--port', type=int, default=DEFAULT_PORT, help='Local HTTP port')
@@ -703,7 +717,7 @@ def build_parser():
 
 
 def cli_main(options):
-    '''Run Hermes from the terminal without a GUI.'''
+    '''Run Warp from the terminal without a GUI.'''
     state = AppState()
     print('\U0001F680 Starting Satellite Server...')
     print('\u23F3 Waiting for Tunnel URL...' if options['mode'] == ConnectionMode.CLOUDFLARE else '\u23F3 Starting local server...')
@@ -763,7 +777,7 @@ def main():
     enable_dpi_awareness()
     root = tk.Tk()
     root.tk.call('tk', 'scaling', get_dpi_scaling_factor() * (96.0 / 72.0))
-    HermesUI(root, state)
+    WarpUI(root, state)
     root.mainloop()
 
 

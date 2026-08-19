@@ -1,4 +1,4 @@
-# Hermes Remote Connectivity
+# Warp
 
 A lightweight remote command execution server with a small Tkinter control panel and a terminal mode. It supports two ways to expose the local HTTP server: **Local network** and **Cloudflare Tunnel**. An authenticated client can run shell commands remotely and get back `stdout`/`stderr`/exit code as JSON.
 
@@ -9,7 +9,7 @@ A lightweight remote command execution server with a small Tkinter control panel
 - **Cloudflare** — Quick Tunnel (downloads `cloudflared` automatically).
 - **Terminal mode** — run the tool directly from the command line with arguments.
 - **Cross-platform** — Windows and Linux (amd64 / arm64).
-- **Audit log** — all executed commands are logged to `hermes_audit.log`.
+- **Audit log** — all executed commands are logged to `warp_audit.log`.
 
 ## How it works
 
@@ -87,14 +87,14 @@ Install PyInstaller and build both a windowed GUI executable and a console execu
 ```bash
 pip install pyinstaller
 
-pyinstaller --onefile --windowed --name AiRemoteAccess main.py
-pyinstaller --onefile --console --name AiRemoteAccessConsole main.py
+pyinstaller --onefile --windowed --name Warp --icon=app_icon.ico --add-data "app_icon.ico;." main.py
+pyinstaller --onefile --console --name WarpConsole --icon=app_icon.ico --add-data "app_icon.ico;." main.py
 ```
 
 Output binaries are placed in `dist/`:
 
-- **`AiRemoteAccess.exe`** — no console window, launches straight into the GUI.
-- **`AiRemoteAccessConsole.exe`** — keeps a console window, needed for `--no-gui` terminal usage.
+- **`Warp.exe`** — no console window, launches straight into the GUI.
+- **`WarpConsole.exe`** — keeps a console window, needed for `--no-gui` terminal usage.
 
 ## Requirements
 
