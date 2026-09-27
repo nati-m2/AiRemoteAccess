@@ -2,6 +2,23 @@
 
 A lightweight remote command execution server with a small Tkinter control panel and a terminal mode. It supports two ways to expose the local HTTP server: **Local network** and **Cloudflare Tunnel**. An authenticated client can run shell commands remotely and get back `stdout`/`stderr`/exit code as JSON.
 
+## Why this exists
+
+Warp is a bridge that gives a **sandboxed AI agent temporary terminal access to a specific machine** — without installing anything on that machine.
+
+The problem it solves: an AI coding/ops agent running in its own sandbox can't reach into another server to actually run commands there. Sometimes you need it to — for example, to **debug a live issue** on a box where reproducing the problem locally isn't possible.
+
+With Warp you:
+
+1. Run this single, dependency-free script on the target machine (or a prebuilt binary — nothing to install).
+2. Expose it over the LAN or a throwaway **Cloudflare Quick Tunnel**, which hands you a temporary public URL and a random bearer token.
+3. Give that URL + token to your agent. It can now run shell commands on the machine and read back `stdout`/`stderr`/exit code to investigate and fix the problem.
+4. Stop the server when you're done — the tunnel, URL and token all disappear with the process.
+
+Because access is **token-gated and ephemeral**, the agent only has reach for as long as you keep Warp running. Every command it runs is written to an audit log so you can see exactly what it did.
+
+> ⚠️ This grants real shell access to whoever holds the URL + token. Only run it on machines you control, hand the credentials only to your own agent, and stop it as soon as the debugging session is over. See [Disclaimer](#disclaimer).
+
 ## Features
 
 - **GUI** — modern dark-themed Tkinter control panel to choose a connection mode and start/stop the server.
@@ -44,6 +61,8 @@ Available arguments:
 | `--timeout` | `30` | Max seconds a command may run |
 | `--no-gui` | off | Run in terminal mode (also used automatically when tkinter is missing) |
 
+To stop the terminal server, press **`q`** (or **Enter**). This shuts down gracefully on the main thread and releases the port. **Ctrl+C** also works as a fallback. A prebuilt binary whose name contains `console` or `cli` starts in terminal mode automatically, without `--no-gui`.
+
 ## Client example
 
 ```bash
@@ -80,21 +99,32 @@ All tunables live at the top of `main.py`:
 | `MAX_FAILED_ATTEMPTS` | `5` | Failed auth attempts before lockout |
 | `LOCKOUT_SECONDS` | `60` | Base lockout duration (doubles per repeat offense) |
 
-## Building an executable (Windows)
+## Building an executable
 
-Install PyInstaller and build both a windowed GUI executable and a console executable from the same script:
+The repo ships PyInstaller spec files. Install PyInstaller, then build from the spec (the same `main.py` powers both the GUI and CLI builds — the only difference is whether a window is attached):
 
 ```bash
 pip install pyinstaller
 
-pyinstaller --onefile --windowed --name Warp --icon=app_icon.ico --add-data "app_icon.ico;." main.py
-pyinstaller --onefile --console --name WarpConsole --icon=app_icon.ico --add-data "app_icon.ico;." main.py
+# GUI build
+pyinstaller --noconfirm AiRemoteAccess.spec        # -> dist/Warp
+# CLI build
+pyinstaller --noconfirm WarpCli.spec               # -> dist/warp-cli
 ```
+
+> On distros with an externally-managed Python (e.g. Arch), create a venv first: `python -m venv .venv && .venv/bin/pip install pyinstaller`, then call `.venv/bin/pyinstaller`.
 
 Output binaries are placed in `dist/`:
 
-- **`Warp.exe`** — no console window, launches straight into the GUI.
-- **`WarpConsole.exe`** — keeps a console window, needed for `--no-gui` terminal usage.
+- **`Warp`** — no console window, launches straight into the GUI.
+- **`warp-cli`** — console build; its name contains `cli`, so it starts in terminal mode automatically (no `--no-gui` needed).
+
+The equivalent Windows one-liners (produce `Warp.exe` / `WarpConsole.exe`, both auto-detected as terminal builds by the `console`/`cli` name rule):
+
+```bash
+pyinstaller --onefile --windowed --name Warp --icon=app_icon.ico --add-data "app_icon.ico;." main.py
+pyinstaller --onefile --console  --name WarpConsole --icon=app_icon.ico --add-data "app_icon.ico;." main.py
+```
 
 ## Requirements
 
