@@ -7,6 +7,7 @@ import queue
 import ctypes
 import shutil
 import socket
+import signal
 import getpass
 import secrets
 import platform
@@ -314,11 +315,24 @@ class RemoteHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class WarpHTTPServer(http.server.ThreadingHTTPServer):
+    '''ThreadingHTTPServer that shuts down cleanly and frees its port.
+
+    Request-handling threads are daemons so an in-flight command can never keep
+    the process (and therefore the bound port) alive after a stop/Ctrl+C, and
+    ``block_on_close`` is disabled so ``server_close`` never hangs waiting on
+    them. ``allow_reuse_address`` lets the port be rebound immediately.
+    '''
+    daemon_threads = True
+    block_on_close = False
+    allow_reuse_address = True
+
+
 def start_http_server(state):
     '''Start the local HTTP server in a background thread.'''
     try:
         handler = make_handler(state)
-        state.server = http.server.ThreadingHTTPServer((state.listen_host, state.port), handler)
+        state.server = WarpHTTPServer((state.listen_host, state.port), handler)
         threading.Thread(target=state.server.serve_forever, daemon=True).start()
     except Exception as e:
         raise RuntimeError(f'Failed to start local server: {e}')
@@ -698,11 +712,15 @@ class WarpUI:
 
 
 def _is_console_build():
-    '''True when running as the frozen console-only executable (name contains 'console').'''
+    '''True when running as the frozen console-only executable.
+
+    Detected by the executable name containing 'console' or 'cli', so both the
+    ``WarpConsole`` and ``warp-cli`` builds start in terminal mode automatically.
+    '''
     if not getattr(sys, 'frozen', False):
         return False
-    exe_name = os.path.basename(sys.executable)
-    return 'console' in exe_name.lower()
+    exe_name = os.path.basename(sys.executable).lower()
+    return 'console' in exe_name or 'cli' in exe_name
 
 
 def build_parser():
@@ -716,15 +734,75 @@ def build_parser():
     return parser
 
 
+def _wait_for_quit_key(stop_flag):
+    '''Set ``stop_flag['flag']`` when the user presses 'q' (or Enter/Esc).
+
+    This gives the terminal build a graceful shutdown that runs entirely on the
+    main thread with no signal involved, so cleanup always finishes and the port
+    is released. Falls back silently when there is no interactive TTY (piped
+    input, service manager, etc.), leaving Ctrl+C/SIGTERM as the stop path.
+    '''
+    quit_chars = ('q', 'Q', '\r', '\n', '\x1b', '\x03')
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            return
+        if os.name == 'nt':
+            import msvcrt
+            while not stop_flag['flag']:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in quit_chars:
+                        break
+                else:
+                    time.sleep(0.08)
+        else:
+            import termios
+            import tty
+            import select
+            fd = sys.stdin.fileno()
+            old_attrs = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                while not stop_flag['flag']:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                    if ready and sys.stdin.read(1) in quit_chars:
+                        break
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    except Exception:
+        return
+    finally:
+        stop_flag['flag'] = True
+
+
 def cli_main(options):
     '''Run Warp from the terminal without a GUI.'''
     state = AppState()
+
+    # Handle Ctrl+C by asking the main loop to exit gracefully instead of raising
+    # KeyboardInterrupt at an arbitrary point (which could surface mid-cleanup as
+    # an unhandled traceback and leave the port bound).
+    stop_requested = {'flag': False}
+
+    def _request_stop(signum, frame):
+        stop_requested['flag'] = True
+
+    try:
+        signal.signal(signal.SIGINT, _request_stop)
+        signal.signal(signal.SIGTERM, _request_stop)
+    except Exception:
+        pass
+
+    # Preferred graceful stop: a keypress handled on the main thread, so cleanup
+    # never races with a signal tearing the process down mid-shutdown.
+    threading.Thread(target=_wait_for_quit_key, args=(stop_requested,), daemon=True).start()
+
     print('\U0001F680 Starting Satellite Server...')
     print('\u23F3 Waiting for Tunnel URL...' if options['mode'] == ConnectionMode.CLOUDFLARE else '\u23F3 Starting local server...')
     threading.Thread(target=start_connection, args=(state, options), daemon=True).start()
     url_printed = False
     try:
-        while state.running or state.tunnel_proc is not None:
+        while not stop_requested['flag'] and (state.running or state.tunnel_proc is not None):
             time.sleep(0.25)
             try:
                 while True:
@@ -742,7 +820,7 @@ def cli_main(options):
                         print()
                         copy_to_clipboard(f'URL: {url}\nToken: {token}\n')
                         print('\U0001F4CB Copied URL & TOKEN to clipboard.')
-                        print('Ctrl+C to stop and clean up.')
+                        print("⌨️  Press 'q' to stop and clean up (Ctrl+C also works).")
                         url_printed = True
                     elif msg.get('type') == 'error':
                         print(f"Error: {msg.get('message')}")
@@ -751,7 +829,16 @@ def cli_main(options):
     except KeyboardInterrupt:
         pass
     finally:
+        # Ignore any further Ctrl+C while we clean up so the shutdown always runs
+        # to completion and the port is released, without dumping a traceback.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except Exception:
+            pass
+        print('\n\U0001F6D1 Stopping and cleaning up...')
         stop_connection(state)
+        print('✅ Stopped. Port released.')
 
 
 def main():
