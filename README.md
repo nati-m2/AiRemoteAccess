@@ -61,14 +61,42 @@ Available arguments:
 | `--timeout` | `30` | Max seconds a command may run |
 | `--no-gui` | off | Run in terminal mode (also used automatically when tkinter is missing) |
 
+| `--no-tls` | off | Disable HTTPS in local mode (HTTPS is on by default) |
+
 To stop the terminal server, press **`q`** (or **Enter**). This shuts down gracefully on the main thread and releases the port. **Ctrl+C** also works as a fallback. A prebuilt binary whose name contains `console` or `cli` starts in terminal mode automatically, without `--no-gui`.
+
+## Local HTTPS (TLS)
+
+In **Local** mode the server speaks **HTTPS by default** so the bearer token and command output are encrypted on the LAN. It is fully transparent and leaves **nothing on disk**:
+
+- On every start, Warp generates a fresh self-signed certificate with `openssl` in a temp file, loads it into the SSL context (which keeps it in memory), and **deletes the file immediately** — so no certificate is stored between runs, or even while the server is running.
+- Because the cert is regenerated each run, its **SHA-256 fingerprint changes every time** (like the random token). Warp prints the fingerprint on startup and copies it to the clipboard with the URL and token, so you hand the current one to your client per session.
+
+Because the certificate is self-signed, the client connects one of two ways:
+
+- **Encrypt only** — skip verification (`curl -k`, or `verify=False`). This defeats passive LAN sniffing of the token, which is the main local threat.
+- **Encrypt + authenticate the server** — pin the printed fingerprint (like an SSH host key), which also defends against active man-in-the-middle on the LAN:
+
+  ```bash
+  echo | openssl s_client -connect <ip>:<port> 2>/dev/null \
+    | openssl x509 -fingerprint -sha256 -noout
+  # compare the result to the SHA-256 Warp printed
+  ```
+
+**Cloudflare** mode is unaffected: the public hop is already TLS-terminated by Cloudflare, and Warp reaches the origin over loopback, so no local certificate is used. Pass `--no-tls` to serve plain HTTP in local mode if you really want it.
 
 ## Client example
 
 ```bash
+# Cloudflare mode (public HTTPS URL):
 curl -X POST https://<url> \
   -H "Authorization: Bearer <TOKEN>" \
   -H "Content-Type: application/json" \
+  -d '{"command": "echo hello"}'
+
+# Local mode (HTTPS with a self-signed cert — add -k, or pin the fingerprint):
+curl -k -X POST https://<ip>:<port> \
+  -H "Authorization: Bearer <TOKEN>" \
   -d '{"command": "echo hello"}'
 ```
 
@@ -80,6 +108,7 @@ Response:
 
 ## Security hardening
 
+- **Encrypted transport** — local mode serves HTTPS by default via a persistent self-signed cert (see [Local HTTPS](#local-https-tls)); Cloudflare mode is TLS-terminated at the edge.
 - **Bearer token auth** — constant-time comparison via `secrets.compare_digest`.
 - **Command timeout** — commands are killed after the configured timeout (default 30s).
 - **Request size limit** — bodies larger than `MAX_BODY_SIZE` (1 MB) are rejected with `413`.

@@ -7,9 +7,11 @@ import queue
 import ctypes
 import shutil
 import socket
+import ssl
 import signal
 import getpass
 import secrets
+import tempfile
 import platform
 import threading
 import subprocess
@@ -101,6 +103,8 @@ class AppState:
         self.running = False
         self.cmd_timeout = DEFAULT_CMD_TIMEOUT
         self.server = None
+        self.use_tls = True
+        self.fingerprint = None
         self.tunnel_proc = None
         self.tunnel_log_fd = None
         self.public_url = None
@@ -315,6 +319,57 @@ class RemoteHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def generate_tls_cert():
+    '''Generate a fresh self-signed cert+key in temp files and return their paths.
+
+    A new certificate is made on every start (via ``openssl``) so nothing is left
+    on disk between runs. The caller loads them into an SSL context — which keeps
+    the material in memory — and then deletes the files immediately, so they exist
+    only for the moment of loading. ``mkstemp`` creates the files ``0600``.
+    '''
+    openssl = shutil.which('openssl')
+    if not openssl:
+        raise RuntimeError(
+            'openssl not found; cannot generate a TLS certificate. '
+            'Install openssl or pass --no-tls.'
+        )
+    cert_fd, certfile = tempfile.mkstemp(suffix='.pem', prefix='warp_cert_')
+    key_fd, keyfile = tempfile.mkstemp(suffix='.pem', prefix='warp_key_')
+    os.close(cert_fd)
+    os.close(key_fd)
+    base_cmd = [
+        openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+        '-keyout', keyfile, '-out', certfile, '-days', '3650',
+        '-subj', '/CN=warp',
+    ]
+    # SAN is nice-to-have; retry without it on older openssl that lacks -addext.
+    for cmd in (base_cmd + ['-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1'], base_cmd):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return certfile, keyfile
+    for f in (certfile, keyfile):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    raise RuntimeError(f'openssl failed to generate certificate: {result.stderr.strip()}')
+
+
+def cert_fingerprint(certfile):
+    '''Return the SHA-256 fingerprint of a certificate, or None if unavailable.'''
+    openssl = shutil.which('openssl')
+    if not openssl:
+        return None
+    try:
+        out = subprocess.run(
+            [openssl, 'x509', '-in', certfile, '-fingerprint', '-sha256', '-noout'],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return out.split('=', 1)[1] if '=' in out else out or None
+    except Exception:
+        return None
+
+
 class WarpHTTPServer(http.server.ThreadingHTTPServer):
     '''ThreadingHTTPServer that shuts down cleanly and frees its port.
 
@@ -333,10 +388,26 @@ def start_http_server(state):
     try:
         handler = make_handler(state)
         state.server = WarpHTTPServer((state.listen_host, state.port), handler)
+        if state.use_tls:
+            certfile, keyfile = generate_tls_cert()
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(certfile, keyfile)
+                state.fingerprint = cert_fingerprint(certfile)
+            finally:
+                # Files exist only for this load; the context keeps the cert and
+                # key in memory, so nothing is left on disk while the server runs.
+                for f in (certfile, keyfile):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+            state.server.socket = ctx.wrap_socket(state.server.socket, server_side=True)
         threading.Thread(target=state.server.serve_forever, daemon=True).start()
     except Exception as e:
         raise RuntimeError(f'Failed to start local server: {e}')
-    state.status_queue.put({'type': 'status', 'message': f'Local server started on {state.listen_host}:{state.port}'})
+    scheme = 'https' if state.use_tls else 'http'
+    state.status_queue.put({'type': 'status', 'message': f'Local server started on {scheme}://{state.listen_host}:{state.port}'})
 
 
 def stop_http_server(state):
@@ -423,15 +494,21 @@ def start_connection(state, options):
         state.cmd_timeout = int(options['timeout'])
         if state.mode == ConnectionMode.LOCAL:
             state.listen_host = '0.0.0.0'
+            # TLS applies to local mode only. Cloudflare already encrypts the
+            # public hop and reaches the origin over loopback, so no cert there.
+            # The cert is generated (and its files deleted) inside start_http_server.
+            state.use_tls = bool(options.get('tls', True))
         else:
             state.listen_host = '127.0.0.1'
+            state.use_tls = False
         state.running = True
         start_http_server(state)
         time.sleep(0.5)
         if state.mode == ConnectionMode.LOCAL:
+            scheme = 'https' if state.use_tls else 'http'
             ips = get_local_ips()
-            urls = [f'http://{ip}:{state.port}' for ip in ips]
-            state.public_url = urls[0] if urls else f'http://127.0.0.1:{state.port}'
+            urls = [f'{scheme}://{ip}:{state.port}' for ip in ips]
+            state.public_url = urls[0] if urls else f'{scheme}://127.0.0.1:{state.port}'
         elif state.mode == ConnectionMode.CLOUDFLARE:
             state.public_url = start_cloudflare_tunnel(state)
         state.status_queue.put({
@@ -439,6 +516,7 @@ def start_connection(state, options):
             'url': state.public_url,
             'token': state.token,
             'mode': MODE_LABELS.get(state.mode, state.mode.value),
+            'fingerprint': state.fingerprint if state.use_tls else None,
         })
     except Exception as e:
         state.running = False
@@ -486,6 +564,7 @@ class WarpUI:
         self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
         self.token_var = tk.StringVar(value=state.token)
         self.timeout_var = tk.StringVar(value=str(DEFAULT_CMD_TIMEOUT))
+        self.tls_var = tk.BooleanVar(value=True)
 
         self.url_var = tk.StringVar()
         self.token_info_var = tk.StringVar()
@@ -508,6 +587,8 @@ class WarpUI:
         style.configure('Card.TFrame', background=self.BG_CARD)
         style.configure('TLabel', background=self.BG, foreground=self.FG)
         style.configure('Card.TLabel', background=self.BG_CARD, foreground=self.FG)
+        style.configure('Card.TCheckbutton', background=self.BG_CARD, foreground=self.FG)
+        style.map('Card.TCheckbutton', background=[('active', self.BG_CARD)], foreground=[('active', self.FG)])
         style.configure('Muted.TLabel', background=self.BG, foreground=self.FG_MUTED, font=('Segoe UI', 9))
         style.configure('CardMuted.TLabel', background=self.BG_CARD, foreground=self.FG_MUTED, font=('Segoe UI', 9))
         style.configure('Title.TLabel', background=self.BG, foreground=self.FG, font=('Segoe UI', 16, 'bold'))
@@ -576,6 +657,9 @@ class WarpUI:
         ttk.Label(settings, text='Timeout (s)', style='Card.TLabel').grid(row=4, column=0, sticky=tk.W, **pad)
         ttk.Entry(settings, textvariable=self.timeout_var, width=10).grid(row=4, column=1, sticky=tk.W, **pad)
 
+        ttk.Checkbutton(settings, text='HTTPS (local mode)', variable=self.tls_var,
+                        style='Card.TCheckbutton').grid(row=5, column=1, columnspan=2, sticky=tk.W, **pad)
+
         # Action buttons
         btn_frame = ttk.Frame(outer, style='TFrame')
         btn_frame.grid(row=2, column=0, sticky='ew', pady=(16, 16))
@@ -628,6 +712,7 @@ class WarpUI:
             'port': port,
             'token': self.token_var.get().strip(),
             'timeout': timeout,
+            'tls': bool(self.tls_var.get()),
         }
 
     def _on_start(self):
@@ -657,6 +742,9 @@ class WarpUI:
         if not url:
             return
         text = f'URL: {url}\nToken: {token}\n'
+        fingerprint = getattr(self, '_last_fingerprint', None)
+        if fingerprint:
+            text += f'Cert SHA-256: {fingerprint}\n'
         copy_to_clipboard(text)
         self._set_status('Copied to clipboard', self.SUCCESS)
 
@@ -676,6 +764,7 @@ class WarpUI:
         elif mtype == 'ready':
             self.url_var.set(msg.get('url', ''))
             self.token_info_var.set(msg.get('token', ''))
+            self._last_fingerprint = msg.get('fingerprint')
             self._set_status(f"{msg.get('mode', '')} active", self.SUCCESS)
             self.start_btn.config(state='disabled')
             self.stop_btn.config(state='normal')
@@ -731,6 +820,8 @@ def build_parser():
     parser.add_argument('--token', default='', help='Bearer token (random if empty)')
     parser.add_argument('--timeout', type=int, default=DEFAULT_CMD_TIMEOUT, help='Command timeout in seconds')
     parser.add_argument('--no-gui', action='store_true', help='Run in terminal mode')
+    parser.add_argument('--no-tls', action='store_true',
+                        help='Disable HTTPS in local mode (on by default; served over a persistent self-signed cert)')
     return parser
 
 
@@ -745,13 +836,12 @@ def _wait_for_quit_key(stop_flag):
     quit_chars = ('q', 'Q', '\r', '\n', '\x1b', '\x03')
     try:
         if not sys.stdin or not sys.stdin.isatty():
-            return
+            return  # no interactive keyboard: rely on Ctrl+C/SIGTERM, do NOT stop
         if os.name == 'nt':
             import msvcrt
             while not stop_flag['flag']:
                 if msvcrt.kbhit():
-                    ch = msvcrt.getwch()
-                    if ch in quit_chars:
+                    if msvcrt.getwch() in quit_chars:
                         break
                 else:
                     time.sleep(0.08)
@@ -771,8 +861,9 @@ def _wait_for_quit_key(stop_flag):
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
     except Exception:
         return
-    finally:
-        stop_flag['flag'] = True
+    # Only reached by falling through the key loop (a quit key was pressed or the
+    # stop flag was already set) — never on the no-TTY early return above.
+    stop_flag['flag'] = True
 
 
 def cli_main(options):
@@ -799,6 +890,10 @@ def cli_main(options):
 
     print('\U0001F680 Starting Satellite Server...')
     print('\u23F3 Waiting for Tunnel URL...' if options['mode'] == ConnectionMode.CLOUDFLARE else '\u23F3 Starting local server...')
+    # Mark running up front so the wait loop below can't exit before the worker
+    # thread has had a chance to flip the flag (it only sets running=False on a
+    # real startup error, which the loop then reports).
+    state.running = True
     threading.Thread(target=start_connection, args=(state, options), daemon=True).start()
     url_printed = False
     try:
@@ -816,9 +911,15 @@ def cli_main(options):
                         print('\u2705 REMOTE ACCESS READY')
                         print(f'\U0001F517 URL: {url}')
                         print(f'\U0001F511 TOKEN: {token}')
+                        fingerprint = msg.get('fingerprint')
+                        if fingerprint:
+                            print(f'\U0001F512 CERT SHA-256: {fingerprint}')
                         print(separator)
                         print()
-                        copy_to_clipboard(f'URL: {url}\nToken: {token}\n')
+                        clip = f'URL: {url}\nToken: {token}\n'
+                        if fingerprint:
+                            clip += f'Cert SHA-256: {fingerprint}\n'
+                        copy_to_clipboard(clip)
                         print('\U0001F4CB Copied URL & TOKEN to clipboard.')
                         print("⌨️  Press 'q' to stop and clean up (Ctrl+C also works).")
                         url_printed = True
@@ -850,6 +951,7 @@ def main():
         'port': args.port,
         'token': args.token,
         'timeout': args.timeout,
+        'tls': not args.no_tls,
     }
 
     if args.no_gui or not TKINTER_AVAILABLE or _is_console_build():
