@@ -1,9 +1,0 @@
-{"timestamp": "2026-08-03 18:55:41", "ip": "127.0.0.1", "command": "echo hello", "status": "executed", "exit_code": 0, "user": null, "allowed_paths": null}
-{"timestamp": "2026-08-03 18:55:48", "ip": "127.0.0.1", "command": "python --version", "status": "executed", "exit_code": 0, "user": "nati", "allowed_paths": ["D:/PyProject/AiRemoteAccess"]}
-{"timestamp": "2026-08-03 18:56:26", "ip": "127.0.0.1", "command": "python --version", "status": "executed", "exit_code": 0, "user": "nati", "allowed_paths": ["D:/PyProject/AiRemoteAccess"]}
-{"timestamp": "2026-08-03 19:01:09", "ip": "127.0.0.1", "command": "python --version", "status": "executed", "exit_code": 0, "user": "nati", "allowed_paths": ["D:/PyProject/AiRemoteAccess"]}
-{"timestamp": "2026-08-03 19:06:46", "ip": "192.168.0.7", "command": "whoami && hostname", "status": "executed", "exit_code": 0, "user": null, "allowed_paths": null}
-{"timestamp": "2026-08-03 19:07:01", "ip": "192.168.0.7", "command": "start calc", "status": "executed", "exit_code": 0, "user": null, "allowed_paths": null}
-{"timestamp": "2026-08-03 19:07:37", "ip": "192.168.0.7", "command": "hostname", "status": "executed", "exit_code": 0, "user": null, "allowed_paths": null}
-{"timestamp": "2026-08-03 19:08:52", "ip": "192.168.0.7", "command": "dir C:\\Users", "status": "executed", "exit_code": 0, "user": "nati", "allowed_paths": ["D:\\PyProject\\BaseAgent"]}
-{"timestamp": "2026-08-03 19:10:07", "ip": "192.168.0.7", "command": "dir C:\\Users", "status": "executed", "exit_code": 0, "user": "nati", "allowed_paths": ["D:\\PyProject\\BaseAgent"]}
