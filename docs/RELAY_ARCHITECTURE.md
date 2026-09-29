@@ -1,207 +1,239 @@
-# AiRemoteAccess — ארכיטקטורת Relay (תכנון לפיתוח עתידי)
+# AiRemoteAccess — Relay Architecture (future-development design)
 
-> **סטטוס: טיוטת תכנון.** המסמך הזה לא מתאר את הכלי הקיים בריפו (`warp`), אלא
-> **חזון לגרסה עתידית ונפרדת**. אם הכלי יתפתח לכיוון הזה, זה כנראה ייכתב מאפס
-> כפרויקט עצמאי — הכלי הנוכחי הוא כלי חד-פעמי (ephemeral), והרילי המתואר כאן הוא
-> שירות תמידי. שמור את המסמך כנקודת מוצא לאותו פרויקט.
+> **Status: draft design.** This document does **not** describe the current tool
+> in this repo (`warp`). It describes a **vision for a future, separate version**.
+> If the tool ever moves in this direction it will most likely be written from
+> scratch as a standalone project — the current tool is ephemeral (one-shot),
+> while the relay described here is a persistent service. Keep this as the
+> starting point for that project.
 
-שליטה מרחוק ביוזמת AI, דרך שרת מתווך (Relay) שכל משתמש מארח לעצמו (self-hosted),
-שעובד גם מעבר ל-NAT.
+AI-initiated remote control, through a **self-hosted** relay server that each
+user runs for themselves, working across NAT.
 
 ---
 
-## מודל ומונחים
+## Model and terminology
 
-שלושה אקטורים. אף אחד מהם לא מחובר ישירות לאחרים — **הכול עובר דרך הרילי**:
+Three actors. None of them connects directly to the others — **everything goes
+through the relay**:
 
-| אקטור | תפקיד |
+| Actor | Role |
 |---|---|
-| **סוכן (AI)** | היוזם. מקבל משימה ומבקש פעולות דרך `MCP`. לעולם לא נוגע במכונה ישירות. |
-| **רילי · השרת** | שירות מרכזי self-hosted. אוכף מדיניות, מנתב פקודות, ומחזיק את ה-audit. נקודת השליטה. |
-| **לקוח · הכלי** | רץ על מכונת היעד. מחייג החוצה אל הרילי, מריץ פקודות, ומחזיר תוצאה. |
+| **Agent (AI)** | The initiator. Receives a task and requests actions over `MCP`. Never touches the machine directly. |
+| **Relay · the server** | Central self-hosted service. Enforces policy, routes commands, and owns the audit log. The control point. |
+| **Client · the tool** | Runs on the target machine. Dials out to the relay, executes commands, and returns the result. |
 
-הרילי הוא רכיב ש**כל משתמש מארח לעצמו** — כמו `hbbs`/`hbbr` של RustDesk או שרת
-MeshCentral. אין רילי מרכזי אחד לכל המשתמשים; אתה מפיץ תוכנה, וכל אחד מרים רילי
-משלו. התוצאה: אף סוד ואף גישה למכונות של אף אחד לא עוברים דרכך.
+The relay is a component that **every user hosts themselves** — like RustDesk's
+`hbbs`/`hbbr` or a MeshCentral server. There is no single central relay for all
+users; you distribute software, and each person stands up their own relay. The
+result: no secret and no access to anyone's machines ever passes through you.
 
 ```mermaid
 flowchart LR
-    AI["סוכן (AI)<br/>יוזם דרך MCP"] -- "MCP tools" --> Relay["רילי · השרת<br/>מדיניות + ניתוב + audit"]
-    Relay -- "פקודות" --> Client["לקוח · הכלי<br/>מריץ ומחזיר תוצאה"]
-    Client -. "WSS יוצא" .-> Relay
-    Relay --> PolicyGate["שער מדיניות<br/>אכיפה לפני ניתוב"]
-    Client --> ApprovalGate["שער אישור<br/>הלקוח מאשר סשן"]
+    AI["Agent (AI)<br/>initiates via MCP"] -- "MCP tools" --> Relay["Relay · the server<br/>policy + routing + audit"]
+    Relay -- "commands" --> Client["Client · the tool<br/>runs and returns result"]
+    Client -. "outbound WSS" .-> Relay
+    Relay --> PolicyGate["Policy gate<br/>enforced before routing"]
+    Client --> ApprovalGate["Approval gate<br/>client approves the session"]
 ```
 
-*בקשה עוברת שני שערים בלתי-תלויים לפני שהיא רצה בפועל.*
+*A request passes through two independent gates before it actually runs.*
 
 ---
 
-## עקרונות ליבה
+## Core principles
 
-- **הלקוח תמיד מחייג החוצה.** הלקוח מאחורי NAT, אז הרילי לא יכול ליזום חיבור
-  פנימה. הלקוח פותח `WSS` יוצא; הרילי דוחף פקודות במורדו. עובד בכל טופולוגיה.
-- **הרילי הוא נקודת השליטה.** ה-AI מדבר רק מול ה-`MCP server` של הרילי. מה שהוא
-  יכול לעשות מוגדר ע"י אילו tools נחשפו ומה המדיניות מרשה — לא ע"י התנהגות ה-AI.
-- **Self-hosted, בלי סודות מרכזיים.** כל משתמש מארח רילי משלו. אין crown-jewel
-  מרכזי שפריצתו חושפת את כולם. גם טיעון מכירה: "הסודות שלך לא עוברים דרכי".
-- **שני שערים בלתי-תלויים.** שער מדיניות ברילי (allowlist, scoping,
-  human-in-the-loop, audit) ושער אישור אנושי אצל הלקוח. פקודה צריכה לעבור את שניהם.
-
----
-
-## זרימת פקודה מקצה לקצה
-
-1. **הלקוח מופעל ואושר**, מחייג לרילי, נרשם ונשאר מחובר. הרילי מסמן אותו online.
-   `Client → Relay · WSS`
-2. **אתה נותן ל-AI משימה** ("בדוק דיסק במכונה X"). ה-AI הוא היוזם. `You → AI`
-3. **ה-AI קורא ל-tool של הרילי.** `AI → Relay · run_command(machine, cmd)`
-4. **הרילי מפעיל שער מדיניות.** אם עבר — דוחף את הפקודה במורד ה-WSS הקיים של
-   הלקוח. `Relay → Client · over existing WSS`
-5. **הלקוח עובר שער אישור** (אם מושגח), מריץ, ושולח תוצאה במעלה אותו WSS.
-   `Client → Relay · result`
-6. **הרילי מחזיר את התוצאה ל-AI** כתשובת ה-tool. `Relay → AI · tool response`
-
-ה-AI אף פעם לא מתחבר ישירות ללקוח, ושום סוד לא נוסע אליו. חלופה ל-socket חי:
-הלקוח עושה **polling** ("יש פקודות בשבילי?") — אותו כיוון ידידותי ל-NAT, רק
-שהלקוח הוא ששואל.
+- **The client always dials out.** The client sits behind NAT, so the relay
+  can't initiate a connection inward. The client opens an outbound `WSS`; the
+  relay pushes commands down it. Works in any topology.
+- **The relay is the control point.** The AI talks only to the relay's
+  `MCP server`. What it can do is defined by which tools are exposed and what the
+  policy allows — not by the AI's behavior.
+- **Self-hosted, no central secrets.** Each user hosts their own relay. There is
+  no central crown-jewel whose breach exposes everyone. Also a selling point:
+  "your secrets never pass through me."
+- **Two independent gates.** A policy gate at the relay (allowlist, scoping,
+  human-in-the-loop, audit) and a human approval gate at the client. A command
+  must clear both.
 
 ---
 
-## מבנה פנימי של הרילי
+## End-to-end command flow
 
-הרילי הוא שירות Docker תמידי עם UI לניהול. שים לב להפרדה בין מידע נדיף למידע מתמיד.
+1. **The client starts and is approved**, dials the relay, registers, and stays
+   connected. The relay marks it online. `Client → Relay · WSS`
+2. **You give the AI a task** ("check the disk on machine X"). The AI is the
+   initiator. `You → AI`
+3. **The AI calls a relay tool.** `AI → Relay · run_command(machine, cmd)`
+4. **The relay runs the policy gate.** If it passes — it pushes the command down
+   the client's existing WSS. `Relay → Client · over existing WSS`
+5. **The client passes the approval gate** (if attended), runs the command, and
+   sends the result back up the same WSS. `Client → Relay · result`
+6. **The relay returns the result to the AI** as the tool response.
+   `Relay → AI · tool response`
+
+The AI never connects directly to the client, and no secret ever travels to it.
+An alternative to a live socket: the client **polls** ("any commands for me?") —
+the same NAT-friendly direction, only the client is the one asking.
+
+---
+
+## Relay internal structure
+
+The relay is a persistent Docker service with a management UI. Note the
+separation between volatile and persistent state.
 
 ```mermaid
 flowchart LR
-    Admin["מנהל (אתה)"] --> UI
+    Admin["Admin (you)"] --> UI
     AIn["AI · MCP"] --> API
-    Clients["לקוחות · WSS"] --> API
-    subgraph Relay["רילי · שירות Docker"]
-        UI["UI לניהול + אימות (login)"] --> API["API<br/>MCP server (AI) · ערוץ WSS (לקוחות)"]
-        API --> Live["Live state · בזיכרון<br/>חיבורים חיים כרגע"]
-        API --> DB["DB מתמיד<br/>audit + מכונות"]
+    Clients["Clients · WSS"] --> API
+    subgraph Relay["Relay · Docker service"]
+        UI["Management UI + auth (login)"] --> API["API<br/>MCP server (AI) · WSS channel (clients)"]
+        API --> Live["Live state · in memory<br/>currently-live connections"]
+        API --> DB["Persistent DB<br/>audit + machines"]
     end
 ```
 
-*ה-DB יושב על Docker volume — שורד `docker compose down`. ה-audit הוא append-only.*
+*The DB sits on a Docker volume — survives `docker compose down`. The audit log
+is append-only.*
 
-### Live state (נדיף, בזיכרון)
-אילו לקוחות מחוברים כרגע, ה-socket החי של כל אחד, סטטוס online/offline. מת
-ומצטבר מחדש בכל פעם שלקוח מחייג — אין טעם לשמר.
+### Live state (volatile, in memory)
+Which clients are connected right now, each one's live socket, online/offline
+status. Dies and rebuilds itself every time a client dials in — no point
+persisting it.
 
-### מידע מתמיד (ב-DB, שורד restart)
-רשומת כל מכונה שנרשמה אי-פעם (hostname, OS + ארכיטקטורה, ראייה אחרונה), וה-audit
-log — כל פקודה, מי יזם, מתי, תוצאה. זה מה ש"לא נמחק". פרטי המכונה מגיעים מהלקוח
-ב-payload הרישום; אל תנסה לגלות אותם מצד הרילי.
-
----
-
-## דרישות אבטחה
-
-- **ה-UI הוא קונסולת השליטה** — חייב login + session. מי שמגיע לפורט בלי אימות
-  מקבל shell על כל המכונות.
-- **audit append-only** — אם ה-UI יכול לערוך או למחוק לוג, זה כבר לא audit אמין.
-  לכל היותר rotation לפי גיל.
-- **אחסון מתמיד ב-volume** — לא בתוך הקונטיינר, אחרת `compose down` מוחק את ה-audit.
-- **הרשאה בשכבת ה-MCP** — *איזה* AI/משתמש מורשה לאיזו מכונה ולאיזה tools. אחרת
-  חשפת `run_command` לכל מי שמדבר עם הרילי.
-- **בטוח כברירת מחדל** — TLS כפוי, token חזק שנוצר אוטומטית בהתקנה, ואזהרה אם
-  רצים חשופים בלי אימות. משתמשים פחות-מנוסים יריצו את זה בעצמם.
-- **זהות סוכן ואישור אפמרי** — אל תשמור ברילי tokens ארוכי-חיים ל-shell; עדיף
-  authorization פר-סשן, וזהות לקוח דרך keypair (רצוי mTLS).
-
-> **שני מצבי-לקוח.** שער האישור אצל הלקוח מתאים כשיש בן אדם ליד המכונה שאמור
-> להסכים (*מושגח*). למכונות שרצות ללא השגחה (*לא-מושגח*) אין מי שילחץ "אשר" — שם
-> מחליפים אותו בהרשאה מוגדרת מראש בזמן ההתקנה, או policy ברילי שמתיר סוג הרצה
-> מוגבל בלבד ללא human-in-the-loop.
+### Persistent state (in the DB, survives restart)
+A record of every machine that ever registered (hostname, OS + architecture,
+last seen), and the audit log — every command, who initiated it, when, and the
+result. This is what "is never deleted." Machine details come from the client in
+the registration payload; don't try to discover them from the relay side.
 
 ---
 
-## חשיפה — agnostic
+## Security requirements
 
-הרילי לא יודע כלום על איך הוא חשוף. הוא מקשיב על `127.0.0.1:PORT`, ואיך שהוא יוצא
-החוצה — Cloudflare Tunnel, reverse proxy, VPN, LAN — זו בחירה של מי שמרים אותו,
-לא של הרילי. אתה מספק origin; החשיפה decoupled. זה מוריד ממך אחריות: אין צורך
-לתמוך ב-N דרכי חשיפה או לצרף tunnel פנימה.
+- **The UI is the control console** — must have login + session. Anyone who
+  reaches the port without auth gets a shell on every machine.
+- **Append-only audit** — if the UI can edit or delete a log entry, it's no
+  longer a trustworthy audit. Age-based rotation at most.
+- **Persistent storage on a volume** — not inside the container, otherwise
+  `compose down` wipes the audit.
+- **Authorization at the MCP layer** — *which* AI/user is allowed on which
+  machine and which tools. Otherwise you've exposed `run_command` to anyone who
+  can talk to the relay.
+- **Secure by default** — forced TLS, a strong token auto-generated at install
+  time, and a warning if running exposed without auth. Less-experienced users
+  will run this themselves.
+- **Agent identity and ephemeral authorization** — don't store long-lived shell
+  tokens on the relay; prefer per-session authorization, and client identity via
+  a keypair (ideally mTLS).
 
-שתי אחריויות נשארות על הרילי דווקא *כי* אינך יודע איך יחשפו אותו:
+> **Two client modes.** The approval gate at the client fits when there's a human
+> next to the machine who is supposed to consent (*attended*). For your own
+> machines that run unattended there's nobody to press "approve" — there you
+> replace it with authorization defined at install time, or a relay policy that
+> permits only a restricted kind of execution without a human in the loop.
 
-- **בטוח גם אם נגיש לעולם** — אימות לפני כל דבר, brute-force lockout, ו-rate
-  limiting. אל תניח שכבת הגנה חיצונית; אם היא קיימת — בונוס.
-- **TLS בקצה, מתועד** — ברוב ה-tunnel/proxy ה-origin רץ HTTP וה-terminator מסיים
-  TLS. תקין — כל עוד אזהרה בהפעלה מונעת חשיפה ישירה בטעות
+---
+
+## Exposure — agnostic
+
+The relay knows nothing about how it's exposed. It listens on `127.0.0.1:PORT`,
+and however it reaches the outside world — Cloudflare Tunnel, reverse proxy, VPN,
+LAN — that's a choice made by whoever runs it, not by the relay. You provide an
+origin; exposure is decoupled. That reduces your responsibility: no need to
+support N exposure methods or bundle a tunnel in.
+
+Two responsibilities stay on the relay precisely *because* you don't know how it
+will be exposed:
+
+- **Safe even if reachable from the world** — auth before anything else, the
+  brute-force lockout, and rate limiting. Don't assume an external protection
+  layer; if one exists — bonus.
+- **TLS at the edge, documented** — with most tunnels/proxies the origin runs
+  HTTP and the terminator handles TLS. That's fine — as long as a startup warning
+  prevents accidental direct exposure
   (`no TLS terminator — do not expose directly`).
 
 ---
 
-## רכיבי הפצה
+## Distribution components
 
-| רכיב | תיאור |
+| Component | Description |
 |---|---|
-| **הרילי** | שרת self-hosted, בינארי אחד (Go מתאים) עם config לפורט/דומיין/tokens. אידיאלית `docker compose up` שמקים בפקודה אחת. |
-| **הלקוח** | בינארי גנרי אחד, חתום וקבוע, שאתה מפיץ. הרילי לא מקמפל אותו — הוא רק מייצר installer שנצמד אליו את ה-URL/token/CA שלו. |
-| **חיבור ה-AI** | ה-MCP server שהרילי חושף, שאליו המשתמש מחבר את ה-AI שלו (`list_machines`, `run_command`…). |
+| **The relay** | Self-hosted server, a single binary (Go fits well) with config for port/domain/tokens. Ideally `docker compose up` brings it up in one command. |
+| **The client** | A single generic, signed, fixed binary that you distribute. The relay doesn't compile it — it only generates an installer that attaches its URL/token/CA to it. |
+| **The AI connection** | The MCP server the relay exposes, which the user connects their AI to (`list_machines`, `run_command`…). |
 
 ---
 
-## Provisioning ו-Enrollment
+## Provisioning and enrollment
 
-איך לקוח מסוים יודע להתחבר לרילי מסוים? הוא לא "מגלה" — הוא נולד עם הידיעה. אתה
-בונה בינארי לקוח גנרי אחד, והרילי מייצר **installer מותאם** שנושא את ה-URL,
-ה-enrollment token וה-CA שלו. הבינארי לא משתנה בין רילי לרילי; רק המעטפת שנצמדת
-אליו. זה config-baking — לא קומפילציה פר-רילי, שתהפוך כל רילי למפעל build.
+How does a given client know to connect to a given relay? It doesn't "discover" —
+it's born knowing. You build one generic client binary, and the relay generates a
+**customized installer** that carries its URL, enrollment token, and CA. The
+binary doesn't change from relay to relay; only the wrapper attached to it does.
+This is config-baking — not per-relay compilation, which would turn every relay
+into a build factory.
 
 ```mermaid
 flowchart LR
-    Relay["הרילי<br/>מייצר את ה-installer"] -- "מייצר" --> Installer["Installer מותאם<br/>URL · token · CA"]
-    Installer -- "מריץ" --> Client["לקוח · גנרי<br/>בינארי חתום קבוע"]
-    Client -. "רישום ראשון · public key + enrollment token" .-> Relay
+    Relay["The relay<br/>generates the installer"] -- "generates" --> Installer["Customized installer<br/>URL · token · CA"]
+    Installer -- "runs" --> Client["Client · generic<br/>fixed signed binary"]
+    Client -. "first registration · public key + enrollment token" .-> Relay
 ```
 
-*ברישום הראשון הרילי מאמת את ה-enrollment token ומנפיק ללקוח זהות קבועה
-מבוססת-keypair.*
+*On first registration the relay verifies the enrollment token and issues the
+client a permanent keypair-based identity.*
 
-הפרדת שני ה-tokens פותרת את בעיית האבטחה האמיתית:
+Separating the two tokens solves the real security problem:
 
-- **enrollment token** — משותף, מוטבע ב-installer, בר-ביטול וסבב. תפקידו היחיד:
-  להוכיח לרילי "אני התקנה לגיטימית".
-- **זהות קבועה** — ברישום הראשון הלקוח מייצר keypair מקומית ושולח public key
-  בלבד. מכאן הוא מזדהה עם הזהות הזאת, לא עם ה-enrollment token.
+- **Enrollment token** — shared, baked into the installer, revocable and
+  rotatable. Its only job: to prove to the relay "I'm a legitimate install."
+- **Permanent identity** — on first registration the client generates a keypair
+  locally and sends only the public key. From then on it identifies with that
+  identity, not with the enrollment token.
 
-כך installer שדלף לא נותן שליטה על מכונות קיימות (לכל אחת זהות משלה), ואפשר לבטל
-enrollment token בלי לגעת ברשומות. "לקוח מותאם לרילי" אף פעם לא אומר "shell-token
-קבוע בפנים".
+This way a leaked installer grants no control over existing machines (each has
+its own identity), and you can revoke an enrollment token without touching any
+records. "A client customized to a relay" never means "a fixed shell token
+inside."
 
 ---
 
-## הבדל מהכלי הקיים (`warp`)
+## Difference from the current tool (`warp`)
 
-ב-README של הכלי הנוכחי כתוב שהלוג נמחק כשעוצרים את התהליך, וכל הגישה אפמרית —
-URL ו-token נעלמים עם התהליך. הרילי הפוך: שירות תמידי עם אחסון מתמיד ולוג שלא
-נמחק — audit שנעלם בכל restart הוא חסר ערך. כלומר הרילי הוא **לא אותו רכיב** כמו
-הכלי החד-פעמי, אלא שירות בפני עצמו. זו הסיבה שהפיתוח העתידי הוא כנראה כתיבה מאפס
-כפרויקט נפרד, ולא הרחבה של `main.py` הקיים.
+The current tool's README states that the log is deleted when the process stops,
+and that all access is ephemeral — the URL and token vanish with the process. The
+relay is the opposite: a persistent service with persistent storage and a log
+that isn't deleted — an audit that disappears on every restart is worthless. In
+other words, the relay is **not the same component** as the one-shot tool; it's a
+service in its own right. That's why the future development is likely a rewrite
+from scratch as a separate project, rather than an extension of the current
+`main.py`.
 
-| | הכלי הקיים (`warp`) | הרילי (עתידי) |
+| | Current tool (`warp`) | Relay (future) |
 |---|---|---|
-| אורך חיים | אפמרי — נעלם עם התהליך | שירות תמידי |
-| audit log | נמחק בעצירה | מתמיד, append-only, ב-volume |
-| טופולוגיה | חיבור ישיר / tunnel חד-פעמי | הלקוח מחייג החוצה, ריבוי מכונות |
-| ריבוי מכונות | מכונה בודדת פר-הרצה | רישום וניהול של הרבה מכונות |
-| ניהול זהויות | token אקראי פר-סשן | enrollment token + keypair קבוע |
-| ממשק AI | URL + token ל-HTTP endpoint | MCP server עם tools ומדיניות |
+| Lifetime | Ephemeral — vanishes with the process | Persistent service |
+| Audit log | Deleted on stop | Persistent, append-only, on a volume |
+| Topology | Direct connection / one-shot tunnel | Client dials out, many machines |
+| Multiple machines | Single machine per run | Registration and management of many machines |
+| Identity management | Random token per session | Enrollment token + permanent keypair |
+| AI interface | URL + token to an HTTP endpoint | MCP server with tools and policy |
 
 ---
 
-## רפרנסים ללמידה
+## References to learn from
 
-Open-source, self-hosted — ללמוד מהדפוסים, **לא** לחבר אליהם את הלקוח שלך:
+Open-source, self-hosted — learn from the patterns, do **not** connect your
+client to them:
 
-- **MeshCentral** ו-**TacticalRMM** — למודל ההרשאות/ההסכמה ול-agent↔broker auth.
-- **hbbs/hbbr של RustDesk** — ל-relay הטהור.
+- **MeshCentral** and **TacticalRMM** — for the permission/consent model and
+  agent↔broker auth.
+- **RustDesk's hbbs/hbbr** — for the pure relay.
 
 ---
 
-*מקור התכנון: `airemoteaccess-relay-design.html`. מסמך זה הוא עיבוד שלו ל-Markdown
-לצורך שמירה בריפו.*
+*Design source: `airemoteaccess-relay-design.html`. This document is a Markdown
+adaptation of it, kept in the repo for reference.*
