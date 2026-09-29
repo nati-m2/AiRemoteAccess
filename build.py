@@ -2,8 +2,8 @@
 """Build Warp executables with PyInstaller.
 
 Produces two variants for the current OS:
-  - GUI  (no console window)      -> dist/Warp[.exe]
-  - CLI  (console / terminal)     -> dist/WarpConsole[.exe]
+  - GUI  (no console window)      -> dist/warp[.exe]
+  - CLI  (console / terminal)     -> dist/warp-cli[.exe]
 
 PyInstaller cannot cross-compile, so run this script once on Linux and once
 on Windows to get binaries for both platforms.
@@ -80,9 +80,9 @@ def main():
     build_cli = ns.cli or not ns.gui
 
     if build_gui:
-        run_pyinstaller("Warp", windowed=True)
+        run_pyinstaller("warp", windowed=True)
     if build_cli:
-        run_pyinstaller("WarpConsole", windowed=False)
+        run_pyinstaller("warp-cli", windowed=False)
 
     print(f"\nDone. Binaries are in: {os.path.join(ROOT, 'dist')}")
 

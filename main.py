@@ -34,6 +34,48 @@ MAX_BODY_SIZE = 1 * 1024 * 1024
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_SECONDS = 60
 
+
+def _init_console_io():
+    '''Make stdout/stderr safe on Windows.
+
+    Two problems this fixes for the frozen builds:
+      * A console using a non-UTF-8 code page (e.g. cp1255 on a Hebrew Windows)
+        raises ``UnicodeEncodeError`` the first time we print an emoji, killing
+        the process immediately. Reconfigure the streams to UTF-8 and, failing
+        that, replace un-encodable characters instead of crashing.
+      * A ``--windowed`` (no-console) build has ``sys.stdout``/``stderr`` set to
+        ``None``; any ``print`` then raises ``AttributeError``. Swap in a sink so
+        printing is always a no-op-safe operation.
+    '''
+    import io
+
+    class _NullWriter(io.TextIOBase):
+        def write(self, _):
+            return 0
+
+        def flush(self):
+            pass
+
+    for name in ('stdout', 'stderr'):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            setattr(sys, name, _NullWriter())
+            continue
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            # Older streams without reconfigure(): best-effort wrap.
+            try:
+                buf = getattr(stream, 'buffer', None)
+                if buf is not None:
+                    setattr(sys, name, io.TextIOWrapper(
+                        buf, encoding='utf-8', errors='replace', line_buffering=True))
+            except Exception:
+                pass
+
+
+_init_console_io()
+
 def enable_dpi_awareness():
     '''Make the process DPI-aware on Windows so Tkinter renders crisp, unscaled text.'''
     if os.name != 'nt':
@@ -319,6 +361,37 @@ class RemoteHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _find_openssl():
+    '''Locate an openssl executable.
+
+    ``shutil.which`` only checks ``PATH``. A frozen build launched from Explorer
+    does not inherit Git Bash's ``PATH``, so a Git-bundled openssl is invisible
+    there. Fall back to well-known install locations before giving up.
+    '''
+    found = shutil.which('openssl')
+    if found:
+        return found
+    if os.name == 'nt':
+        candidates = []
+        for root in (
+            os.environ.get('ProgramFiles', r'C:\Program Files'),
+            os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+            os.environ.get('LOCALAPPDATA', ''),
+        ):
+            if not root:
+                continue
+            candidates += [
+                os.path.join(root, 'Git', 'usr', 'bin', 'openssl.exe'),
+                os.path.join(root, 'Git', 'mingw64', 'bin', 'openssl.exe'),
+                os.path.join(root, 'OpenSSL-Win64', 'bin', 'openssl.exe'),
+                os.path.join(root, 'OpenSSL', 'bin', 'openssl.exe'),
+            ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+    return None
+
+
 def generate_tls_cert():
     '''Generate a fresh self-signed cert+key in temp files and return their paths.
 
@@ -327,7 +400,7 @@ def generate_tls_cert():
     the material in memory — and then deletes the files immediately, so they exist
     only for the moment of loading. ``mkstemp`` creates the files ``0600``.
     '''
-    openssl = shutil.which('openssl')
+    openssl = _find_openssl()
     if not openssl:
         raise RuntimeError(
             'openssl not found; cannot generate a TLS certificate. '
@@ -357,7 +430,7 @@ def generate_tls_cert():
 
 def cert_fingerprint(certfile):
     '''Return the SHA-256 fingerprint of a certificate, or None if unavailable.'''
-    openssl = shutil.which('openssl')
+    openssl = _find_openssl()
     if not openssl:
         return None
     try:
@@ -388,6 +461,14 @@ def start_http_server(state):
     try:
         handler = make_handler(state)
         state.server = WarpHTTPServer((state.listen_host, state.port), handler)
+        if state.use_tls and not _find_openssl():
+            # No openssl available (common when a frozen build is launched from
+            # Explorer): degrade to plain HTTP rather than failing to start.
+            state.use_tls = False
+            state.status_queue.put({
+                'type': 'status',
+                'message': 'openssl not found - serving plain HTTP (install openssl or use Cloudflare mode for encryption).',
+            })
         if state.use_tls:
             certfile, keyfile = generate_tls_cert()
             try:
@@ -568,8 +649,10 @@ class WarpUI:
 
         self.url_var = tk.StringVar()
         self.token_info_var = tk.StringVar()
+        self.fingerprint_var = tk.StringVar()
         self.status_var = tk.StringVar(value='Ready')
         self.status_dot_var = tk.StringVar(value='●')
+        self._audit_tree = None
 
         self._setup_style()
         self._build_ui()
@@ -619,6 +702,24 @@ class WarpUI:
                         font=('Segoe UI', 9), padding=(10, 6), borderwidth=1)
         style.map('Ghost.TButton', background=[('active', self.BORDER)])
 
+        # Tabs
+        style.configure('Warp.TNotebook', background=self.BG, borderwidth=0, tabmargins=(0, 0, 0, 8))
+        style.configure('Warp.TNotebook.Tab', background=self.BG_CARD, foreground=self.FG_MUTED,
+                        padding=(20, 9), font=('Segoe UI', 10, 'bold'), borderwidth=0)
+        style.map('Warp.TNotebook.Tab',
+                  background=[('selected', self.BG_INPUT), ('active', self.BORDER)],
+                  foreground=[('selected', self.FG)])
+
+        # Audit-log table
+        style.configure('Audit.Treeview', background=self.BG_INPUT, fieldbackground=self.BG_INPUT,
+                        foreground=self.FG, bordercolor=self.BORDER, borderwidth=0,
+                        rowheight=24, font=('Segoe UI', 9))
+        style.configure('Audit.Treeview.Heading', background=self.BG_CARD, foreground=self.FG_MUTED,
+                        font=('Segoe UI', 9, 'bold'), relief='flat', borderwidth=0)
+        style.map('Audit.Treeview.Heading', background=[('active', self.BORDER)])
+        style.map('Audit.Treeview', background=[('selected', self.ACCENT)],
+                  foreground=[('selected', '#ffffff')])
+
     def _build_ui(self):
         pad = {'padx': 8, 'pady': 6}
 
@@ -631,11 +732,26 @@ class WarpUI:
         header.grid(row=0, column=0, sticky='ew', pady=(0, 16))
         ttk.Label(header, text='🌀  Warp', style='Title.TLabel').pack(side=tk.LEFT)
 
+        # Tabs: Connection | Log
+        nb = ttk.Notebook(outer, style='Warp.TNotebook')
+        nb.grid(row=1, column=0, sticky='nsew')
+        outer.rowconfigure(1, weight=1)
+
+        conn_tab = ttk.Frame(nb, style='TFrame', padding=(0, 14))
+        conn_tab.columnconfigure(0, weight=1)
+        conn_tab.rowconfigure(2, weight=1)
+        nb.add(conn_tab, text='  Connection  ')
+
+        log_tab = ttk.Frame(nb, style='TFrame', padding=(0, 14))
+        log_tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(0, weight=1)
+        nb.add(log_tab, text='  Log  ')
+
+        # ===== Connection tab =====
         # Settings card
-        settings = ttk.Frame(outer, style='Card.TFrame', padding=16)
-        settings.grid(row=1, column=0, sticky='ew')
+        settings = ttk.Frame(conn_tab, style='Card.TFrame', padding=16)
+        settings.grid(row=0, column=0, sticky='ew')
         settings.columnconfigure(1, weight=1)
-        outer.rowconfigure(1, weight=0)
 
         ttk.Label(settings, text='Connection Settings', style='Section.TLabel', background=self.BG_CARD).grid(
             row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
@@ -661,8 +777,8 @@ class WarpUI:
                         style='Card.TCheckbutton').grid(row=5, column=1, columnspan=2, sticky=tk.W, **pad)
 
         # Action buttons
-        btn_frame = ttk.Frame(outer, style='TFrame')
-        btn_frame.grid(row=2, column=0, sticky='ew', pady=(16, 16))
+        btn_frame = ttk.Frame(conn_tab, style='TFrame')
+        btn_frame.grid(row=1, column=0, sticky='ew', pady=(16, 16))
         self.start_btn = ttk.Button(btn_frame, text='▶  Start', style='Accent.TButton', command=self._on_start)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.stop_btn = ttk.Button(btn_frame, text='■  Stop', style='Danger.TButton', command=self._on_stop, state='disabled')
@@ -670,10 +786,9 @@ class WarpUI:
         ttk.Button(btn_frame, text='⧉  Copy Details', style='Ghost.TButton', command=self._copy_details).pack(side=tk.LEFT)
 
         # Connection info card
-        info = ttk.Frame(outer, style='Card.TFrame', padding=16)
-        info.grid(row=3, column=0, sticky='nsew')
+        info = ttk.Frame(conn_tab, style='Card.TFrame', padding=16)
+        info.grid(row=2, column=0, sticky='new')
         info.columnconfigure(1, weight=1)
-        outer.rowconfigure(3, weight=1)
 
         ttk.Label(info, text='Connection Info', style='Section.TLabel', background=self.BG_CARD).grid(
             row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
@@ -684,12 +799,56 @@ class WarpUI:
         ttk.Label(info, text='Token', style='Card.TLabel').grid(row=2, column=0, sticky=tk.W, **pad)
         ttk.Entry(info, textvariable=self.token_info_var, state='readonly').grid(row=2, column=1, sticky='ew', **pad)
 
+        ttk.Label(info, text='Cert SHA-256', style='Card.TLabel').grid(row=3, column=0, sticky=tk.W, **pad)
+        ttk.Entry(info, textvariable=self.fingerprint_var, state='readonly',
+                  font=('Consolas', 9)).grid(row=3, column=1, sticky='ew', **pad)
+
         status_row = ttk.Frame(info, style='Card.TFrame')
-        status_row.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
+        status_row.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
         self.status_dot = ttk.Label(status_row, textvariable=self.status_dot_var, style='StatusDot.TLabel',
                                     background=self.BG_CARD, foreground=self.FG_MUTED)
         self.status_dot.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Label(status_row, textvariable=self.status_var, style='Card.TLabel').pack(side=tk.LEFT)
+
+        # ===== Log tab =====
+        log_card = ttk.Frame(log_tab, style='Card.TFrame', padding=16)
+        log_card.grid(row=0, column=0, sticky='nsew')
+        log_card.columnconfigure(0, weight=1)
+        log_card.rowconfigure(1, weight=1)
+
+        log_header = ttk.Frame(log_card, style='Card.TFrame')
+        log_header.grid(row=0, column=0, sticky='ew', pady=(0, 10))
+        log_header.columnconfigure(0, weight=1)
+        ttk.Label(log_header, text='Activity Log', style='Section.TLabel',
+                  background=self.BG_CARD).grid(row=0, column=0, sticky=tk.W)
+        ttk.Button(log_header, text='Clear', style='Ghost.TButton',
+                   command=self._clear_audit).grid(row=0, column=1, sticky=tk.E)
+
+        table_wrap = ttk.Frame(log_card, style='Card.TFrame')
+        table_wrap.grid(row=1, column=0, sticky='nsew')
+        table_wrap.columnconfigure(0, weight=1)
+        table_wrap.rowconfigure(0, weight=1)
+
+        columns = ('time', 'ip', 'user', 'command', 'status', 'exit')
+        headings = {'time': 'Time', 'ip': 'IP', 'user': 'User',
+                    'command': 'Command', 'status': 'Status', 'exit': 'Exit'}
+        widths = {'time': 150, 'ip': 110, 'user': 90, 'command': 300, 'status': 90, 'exit': 50}
+        anchors = {'exit': tk.CENTER}
+        tree = ttk.Treeview(table_wrap, columns=columns, show='headings',
+                            style='Audit.Treeview', selectmode='browse')
+        for col in columns:
+            tree.heading(col, text=headings[col])
+            tree.column(col, width=widths[col], anchor=anchors.get(col, tk.W),
+                        stretch=(col == 'command'))
+        # Colour rows by outcome so failures stand out.
+        tree.tag_configure('ok', foreground=self.SUCCESS)
+        tree.tag_configure('bad', foreground=self.DANGER)
+        tree.tag_configure('warn', foreground='#e0b354')
+        vsb = ttk.Scrollbar(table_wrap, orient='vertical', command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        self._audit_tree = tree
 
     def _set_status(self, text, color=None):
         self.status_var.set(text)
@@ -755,7 +914,49 @@ class WarpUI:
                 self._handle_status(msg)
         except queue.Empty:
             pass
+        try:
+            while True:
+                entry = self.state.command_queue.get_nowait()
+                self._append_audit(entry)
+        except queue.Empty:
+            pass
         self.root.after(250, self._poll_queues)
+
+    def _append_audit(self, entry):
+        '''Add one audit entry as a table row (skips transient 'started' events).'''
+        tree = self._audit_tree
+        if tree is None:
+            return
+        status = str(entry.get('status', ''))
+        if status == 'started':
+            return  # the matching terminal event (executed/timeout/error) is enough
+        exit_code = entry.get('exit_code')
+        if status == 'executed':
+            tag = 'ok' if exit_code in (0, '0') else 'bad'
+        elif status == 'timeout':
+            tag = 'warn'
+        elif status.startswith('error'):
+            tag = 'bad'
+        else:
+            tag = ''
+        values = (
+            entry.get('timestamp', ''),
+            entry.get('ip', ''),
+            entry.get('user', ''),
+            entry.get('command', ''),
+            status,
+            '' if exit_code is None else exit_code,
+        )
+        tree.insert('', 'end', values=values, tags=(tag,) if tag else ())
+        # Keep the newest row visible and cap the table so it can't grow unbounded.
+        children = tree.get_children()
+        if len(children) > 500:
+            tree.delete(children[0])
+        tree.see(tree.get_children()[-1])
+
+    def _clear_audit(self):
+        if self._audit_tree is not None:
+            self._audit_tree.delete(*self._audit_tree.get_children())
 
     def _handle_status(self, msg):
         mtype = msg.get('type')
@@ -765,6 +966,7 @@ class WarpUI:
             self.url_var.set(msg.get('url', ''))
             self.token_info_var.set(msg.get('token', ''))
             self._last_fingerprint = msg.get('fingerprint')
+            self.fingerprint_var.set(msg.get('fingerprint') or '—')
             self._set_status(f"{msg.get('mode', '')} active", self.SUCCESS)
             self.start_btn.config(state='disabled')
             self.stop_btn.config(state='normal')
@@ -775,6 +977,7 @@ class WarpUI:
         elif mtype == 'stopped':
             self.url_var.set('')
             self.token_info_var.set('')
+            self.fingerprint_var.set('')
             self._set_status('Ready', self.FG_MUTED)
             self.start_btn.config(state='normal')
             self.stop_btn.config(state='disabled')
@@ -803,8 +1006,9 @@ class WarpUI:
 def _is_console_build():
     '''True when running as the frozen console-only executable.
 
-    Detected by the executable name containing 'console' or 'cli', so both the
-    ``WarpConsole`` and ``warp-cli`` builds start in terminal mode automatically.
+    Detected by the executable name containing 'cli' or 'console', so the
+    ``warp-cli`` build starts in terminal mode automatically (the 'console'
+    match is kept for backward compatibility with older ``WarpConsole`` builds).
     '''
     if not getattr(sys, 'frozen', False):
         return False

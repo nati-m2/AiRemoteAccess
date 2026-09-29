@@ -63,7 +63,7 @@ Available arguments:
 
 | `--no-tls` | off | Disable HTTPS in local mode (HTTPS is on by default) |
 
-To stop the terminal server, press **`q`** (or **Enter**). This shuts down gracefully on the main thread and releases the port. **Ctrl+C** also works as a fallback. A prebuilt binary whose name contains `console` or `cli` starts in terminal mode automatically, without `--no-gui`.
+To stop the terminal server, press **`q`** (or **Enter**). This shuts down gracefully on the main thread and releases the port. **Ctrl+C** also works as a fallback. A prebuilt binary whose name contains `cli` (or `console`) starts in terminal mode automatically, without `--no-gui`.
 
 ## Local HTTPS (TLS)
 
@@ -130,29 +130,31 @@ All tunables live at the top of `main.py`:
 
 ## Building an executable
 
-The repo ships PyInstaller spec files. Install PyInstaller, then build from the spec (the same `main.py` powers both the GUI and CLI builds — the only difference is whether a window is attached):
+The same `main.py` powers both builds — the only difference is whether a console window is attached. The easiest way is the bundled `build.py`, which drives PyInstaller for you and produces both variants:
 
 ```bash
 pip install pyinstaller
 
-# GUI build
-pyinstaller --noconfirm AiRemoteAccess.spec        # -> dist/Warp
-# CLI build
-pyinstaller --noconfirm WarpCli.spec               # -> dist/warp-cli
+python build.py            # build both GUI and CLI for the current OS
+python build.py --gui      # GUI only
+python build.py --cli      # CLI only
+python build.py --clean    # remove build/ and dist/ first
 ```
 
-> On distros with an externally-managed Python (e.g. Arch), create a venv first: `python -m venv .venv && .venv/bin/pip install pyinstaller`, then call `.venv/bin/pyinstaller`.
+On Windows and Linux you can also use the thin wrappers `build.ps1` / `build.sh`, which pick up a local `.venv` automatically.
 
-Output binaries are placed in `dist/`:
+> On distros with an externally-managed Python (e.g. Arch), create a venv first: `python -m venv .venv && .venv/bin/pip install pyinstaller`.
 
-- **`Warp`** — no console window, launches straight into the GUI.
-- **`warp-cli`** — console build; its name contains `cli`, so it starts in terminal mode automatically (no `--no-gui` needed).
+Output binaries are placed in `dist/` with matching names on every platform:
 
-The equivalent Windows one-liners (produce `Warp.exe` / `WarpConsole.exe`, both auto-detected as terminal builds by the `console`/`cli` name rule):
+- **`warp`** / **`warp.exe`** — no console window, launches straight into the GUI.
+- **`warp-cli`** / **`warp-cli.exe`** — console build; its name contains `cli`, so it starts in terminal mode automatically (no `--no-gui` needed).
+
+PyInstaller cannot cross-compile, so run the build once on Windows and once on Linux to get binaries for both. If you prefer to invoke PyInstaller directly instead of `build.py`:
 
 ```bash
-pyinstaller --onefile --windowed --name Warp --icon=app_icon.ico --add-data "app_icon.ico;." main.py
-pyinstaller --onefile --console  --name WarpConsole --icon=app_icon.ico --add-data "app_icon.ico;." main.py
+pyinstaller --onefile --windowed --name warp     --icon=app_icon.ico --add-data "app_icon.ico;." main.py
+pyinstaller --onefile --console  --name warp-cli --icon=app_icon.ico --add-data "app_icon.ico;." main.py
 ```
 
 ## Requirements
