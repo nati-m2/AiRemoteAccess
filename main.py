@@ -14,6 +14,7 @@ import secrets
 import tempfile
 import platform
 import threading
+import traceback
 import subprocess
 import http.server
 import urllib.request
@@ -150,6 +151,7 @@ class AppState:
         self.tunnel_proc = None
         self.tunnel_log_fd = None
         self.public_url = None
+        self.last_error = None
         self.current_user = getpass.getuser()
         self.command_queue = queue.Queue()
         self.status_queue = queue.Queue()
@@ -175,6 +177,36 @@ class AppState:
             except Exception:
                 pass
         self.command_queue.put(entry)
+
+
+def _subprocess_env():
+    '''Return an environment dict for launching external programs, or None.
+
+    PyInstaller's onefile bootloader prepends its extraction directory
+    (``sys._MEIPASS``) to ``LD_LIBRARY_PATH`` so the bundled interpreter can
+    find its own shared libraries. Any *system* binary we then spawn (openssl,
+    cloudflared, xclip, and the user's own remote shell commands) would inherit
+    that path and load our bundled ``libssl``/``libcrypto``/etc. ahead of the
+    system ones. When the host's tools are built against newer libraries than
+    those we bundled, they fail with errors like::
+
+        /usr/bin/openssl: .../libssl.so.3: version `OPENSSL_3.4.0' not found
+
+    The bootloader preserves the pre-launch value in ``<VAR>_ORIG``. Restore it
+    (or drop the variable entirely if it was unset originally) so subprocesses
+    use the system libraries. Returns None when not frozen, meaning "inherit the
+    current environment unchanged".
+    '''
+    if not getattr(sys, 'frozen', False):
+        return None
+    env = dict(os.environ)
+    for key in ('LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH'):
+        orig = env.get(key + '_ORIG')
+        if orig is not None:
+            env[key] = orig
+        else:
+            env.pop(key, None)
+    return env
 
 
 def ensure_cloudflared():
@@ -214,37 +246,39 @@ def get_local_ips():
 
 def copy_to_clipboard(text):
     '''Copy text to the clipboard using OS-native tools.'''
+    env = _subprocess_env()
     try:
         if os.name == 'nt':
-            subprocess.run('clip', input=text.encode('utf-16-le'), shell=True, check=True)
+            subprocess.run('clip', input=text.encode('utf-16-le'), shell=True, check=True, env=env)
         elif sys.platform == 'darwin':
-            subprocess.run('pbcopy', input=text.encode('utf-8'), shell=True, check=True)
+            subprocess.run('pbcopy', input=text.encode('utf-8'), shell=True, check=True, env=env)
         else:
-            subprocess.run('xclip -selection clipboard', input=text.encode('utf-8'), shell=True, check=True)
+            subprocess.run('xclip -selection clipboard', input=text.encode('utf-8'), shell=True, check=True, env=env)
     except Exception:
         pass
 
 
 def kill_orphaned_cloudflared(tracked_pid):
     '''Kill any orphaned cloudflared processes.'''
+    env = _subprocess_env()
     try:
         if os.name == 'nt':
             out = subprocess.run(
                 ['tasklist', '/FI', 'IMAGENAME eq cloudflared.exe', '/FO', 'CSV', '/NH'],
-                capture_output=True, text=True
+                capture_output=True, text=True, env=env
             ).stdout
             for line in out.splitlines():
                 parts = [p.strip('"') for p in line.split(',')]
                 if len(parts) >= 2 and parts[1].isdigit():
                     pid = int(parts[1])
                     if pid != tracked_pid:
-                        subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True)
+                        subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True, env=env)
         else:
-            out = subprocess.run(['pgrep', '-f', 'cloudflared'], capture_output=True, text=True).stdout
+            out = subprocess.run(['pgrep', '-f', 'cloudflared'], capture_output=True, text=True, env=env).stdout
             for line in out.splitlines():
                 pid = int(line.strip())
                 if pid != tracked_pid:
-                    subprocess.run(['kill', '-9', str(pid)], capture_output=True)
+                    subprocess.run(['kill', '-9', str(pid)], capture_output=True, env=env)
     except Exception:
         pass
 
@@ -346,6 +380,7 @@ class RemoteHandler(http.server.BaseHTTPRequestHandler):
                 encoding='utf-8',
                 errors='replace',
                 timeout=self.state.cmd_timeout,
+                env=_subprocess_env(),
             )
             payload = {'stdout': res.stdout, 'stderr': res.stderr, 'exit_code': res.returncode}
             self.state.audit_log(ip, cmd, 'executed', res.returncode)
@@ -416,8 +451,9 @@ def generate_tls_cert():
         '-subj', '/CN=warp',
     ]
     # SAN is nice-to-have; retry without it on older openssl that lacks -addext.
+    env = _subprocess_env()
     for cmd in (base_cmd + ['-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1'], base_cmd):
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if result.returncode == 0:
             return certfile, keyfile
     for f in (certfile, keyfile):
@@ -436,7 +472,7 @@ def cert_fingerprint(certfile):
     try:
         out = subprocess.run(
             [openssl, 'x509', '-in', certfile, '-fingerprint', '-sha256', '-noout'],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=_subprocess_env(),
         ).stdout.strip()
         return out.split('=', 1)[1] if '=' in out else out or None
     except Exception:
@@ -511,6 +547,7 @@ def start_cloudflare_tunnel(state):
             [CF_EXE, 'tunnel', '--url', f'http://127.0.0.1:{state.port}'],
             stdout=state.tunnel_log_fd,
             stderr=state.tunnel_log_fd,
+            env=_subprocess_env(),
         )
     except Exception as e:
         state.tunnel_log_fd.close()
@@ -600,10 +637,14 @@ def start_connection(state, options):
             'fingerprint': state.fingerprint if state.use_tls else None,
         })
     except Exception as e:
+        # Capture the full traceback and queue the error BEFORE clearing
+        # ``running``: the terminal wait loop exits the instant it sees
+        # ``running`` go false, so queuing afterwards loses the message.
+        state.last_error = traceback.format_exc()
+        state.status_queue.put({'type': 'error', 'message': str(e)})
         state.running = False
         stop_http_server(state)
         stop_tunnel(state)
-        state.status_queue.put({'type': 'error', 'message': str(e)})
 
 
 def stop_connection(state):
@@ -1030,23 +1071,36 @@ def build_parser():
 
 
 def _wait_for_quit_key(stop_flag):
-    '''Set ``stop_flag['flag']`` when the user presses 'q' (or Enter/Esc).
+    '''Request shutdown when the user presses 'q'/'Q' on an interactive terminal.
 
     This gives the terminal build a graceful shutdown that runs entirely on the
     main thread with no signal involved, so cleanup always finishes and the port
     is released. Falls back silently when there is no interactive TTY (piped
     input, service manager, etc.), leaving Ctrl+C/SIGTERM as the stop path.
+
+    Only a literal 'q'/'Q' quits. Earlier versions also treated Enter and Esc as
+    quit, which made the server die the instant it started: over SSH the Enter
+    that launched the process can still be buffered on stdin, and terminals
+    routinely send Esc-prefixed sequences (cursor reports, focus events,
+    bracketed paste) on their own — any of which was being read as "quit".
+    Crucially, the flag is now set ONLY when 'q' is actually read; the watcher
+    returning for any other reason must never trigger a shutdown.
     '''
-    quit_chars = ('q', 'Q', '\r', '\n', '\x1b', '\x03')
+    quit_chars = ('q', 'Q')
     try:
         if not sys.stdin or not sys.stdin.isatty():
             return  # no interactive keyboard: rely on Ctrl+C/SIGTERM, do NOT stop
         if os.name == 'nt':
             import msvcrt
+            # Discard any typeahead (e.g. the Enter that ran us) before watching.
+            while msvcrt.kbhit():
+                msvcrt.getwch()
             while not stop_flag['flag']:
                 if msvcrt.kbhit():
                     if msvcrt.getwch() in quit_chars:
-                        break
+                        stop_flag['reason'] = 'q keypress'
+                        stop_flag['flag'] = True
+                        return
                 else:
                     time.sleep(0.08)
         else:
@@ -1057,17 +1111,21 @@ def _wait_for_quit_key(stop_flag):
             old_attrs = termios.tcgetattr(fd)
             try:
                 tty.setcbreak(fd)
+                # Flush pending input so the launching keystroke (and any other
+                # typeahead) can't be misread the moment we start watching.
+                termios.tcflush(fd, termios.TCIFLUSH)
                 while not stop_flag['flag']:
                     ready, _, _ = select.select([sys.stdin], [], [], 0.2)
-                    if ready and sys.stdin.read(1) in quit_chars:
-                        break
+                    if ready:
+                        ch = sys.stdin.read(1)
+                        if ch in quit_chars:
+                            stop_flag['reason'] = 'q keypress'
+                            stop_flag['flag'] = True
+                            return
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
     except Exception:
         return
-    # Only reached by falling through the key loop (a quit key was pressed or the
-    # stop flag was already set) — never on the no-TTY early return above.
-    stop_flag['flag'] = True
 
 
 def cli_main(options):
@@ -1077,9 +1135,10 @@ def cli_main(options):
     # Handle Ctrl+C by asking the main loop to exit gracefully instead of raising
     # KeyboardInterrupt at an arbitrary point (which could surface mid-cleanup as
     # an unhandled traceback and leave the port bound).
-    stop_requested = {'flag': False}
+    stop_requested = {'flag': False, 'reason': None}
 
     def _request_stop(signum, frame):
+        stop_requested['reason'] = f'signal {signum}'
         stop_requested['flag'] = True
 
     try:
@@ -1132,7 +1191,7 @@ def cli_main(options):
             except queue.Empty:
                 pass
     except KeyboardInterrupt:
-        pass
+        stop_requested['reason'] = stop_requested['reason'] or 'KeyboardInterrupt'
     finally:
         # Ignore any further Ctrl+C while we clean up so the shutdown always runs
         # to completion and the port is released, without dumping a traceback.
@@ -1140,6 +1199,17 @@ def cli_main(options):
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         except Exception:
+            pass
+        # A startup error can be queued in the same instant the worker clears
+        # state.running, which exits the wait loop above before the message is
+        # ever drained. Drain once more here so real failures are reported
+        # instead of looking like an instant, silent shutdown.
+        try:
+            while True:
+                msg = state.status_queue.get_nowait()
+                if msg.get('type') == 'error':
+                    print(f"Error: {msg.get('message')}")
+        except queue.Empty:
             pass
         print('\n\U0001F6D1 Stopping and cleaning up...')
         stop_connection(state)
