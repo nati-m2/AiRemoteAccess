@@ -33,12 +33,13 @@ if [ "${1:-}" = "--docker" ]; then
         exit 1
     fi
     echo "=== Building in container: ${WARP_BUILD_IMAGE} ==="
-    # binutils provides objdump/strip, which PyInstaller's --strip needs and
-    # the slim images don't ship. apt output is quieted to keep the log clean.
+    # binutils provides objdump/strip (PyInstaller needs objdump for onefile on
+    # Linux); libtk8.6 supplies the Tcl/Tk runtime libs the slim image omits, so
+    # tkinter (the GUI variants) can be imported and bundled. apt output quieted.
     exec docker run --rm \
         -v "$PWD":/src -w /src \
         "$WARP_BUILD_IMAGE" \
-        bash -c 'apt-get -qq update && apt-get -qq install -y binutils >/dev/null && pip install --quiet pyinstaller && python build.py "$@"' -- "$@"
+        bash -c 'apt-get -qq update && apt-get -qq install -y binutils libtk8.6 >/dev/null && pip install --quiet pyinstaller && python build.py "$@"' -- "$@"
 fi
 
 PY="python3"
